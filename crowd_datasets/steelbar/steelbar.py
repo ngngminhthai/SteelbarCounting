@@ -110,9 +110,9 @@ def load_data(img_gt_path, train):
             points = data["points"]
             
     # Ensure shape is (N, 2) even if points is empty
-    points_arr = np.array(points)
+    points_arr = np.array(points, dtype=np.float32)
     if len(points_arr) == 0:
-        points_arr = np.zeros((0, 2))
+        points_arr = np.zeros((0, 2), dtype=np.float32)
         
     return img, points_arr
 

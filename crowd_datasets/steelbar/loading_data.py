@@ -20,7 +20,7 @@ def loading_data(data_root):
                                     std=[0.229, 0.224, 0.225]),
     ])
     # create the training dataset
-    train_set = Steelbar(data_root, train=True, transform=transform, patch=True, flip=True)
+    train_set = Steelbar(data_root, train=True, transform=transform, patch=False, flip=False)
     # create the validation dataset
     val_set = Steelbar(data_root, train=False, transform=transform)
 

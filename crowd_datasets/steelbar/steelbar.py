@@ -7,6 +7,8 @@ from PIL import Image
 import cv2
 import glob
 import json
+import torchvision.transforms as T
+import torchvision.transforms.functional as TF
 
 class Steelbar(Dataset):
     def __init__(self, data_root, transform=None, train=False, patch=False, flip=False):
@@ -29,6 +31,9 @@ class Steelbar(Dataset):
         self.train = train
         self.patch = patch
         self.flip = flip
+        self.color_jitter = T.ColorJitter(
+            brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05
+        ) if train else None
 
     def __len__(self):
         return self.nSamples
@@ -43,50 +48,15 @@ class Steelbar(Dataset):
         
         # load image and ground truth
         img, point = load_data((img_path, gt_path), self.train)
-        
-        # apply augmentation
+
+        if self.train:
+            img, point = self._augment(img, point)
+
         if self.transform is not None:
             img = self.transform(img)
 
-        if self.train:
-            # data augmentation -> random scale
-            scale_range = [0.7, 1.3]
-            min_size = min(img.shape[1:])
-            scale = random.uniform(*scale_range)
-            # scale the image and points
-            if scale * min_size > 128:
-                img = torch.nn.functional.interpolate(img.unsqueeze(0), scale_factor=scale, mode='bilinear', align_corners=False).squeeze(0)
-                point *= scale
-                
-        # random crop augmentation
-        if self.train and self.patch:
-            img, point = random_crop(img, point)
-            for i, _ in enumerate(point):
-                point[i] = torch.Tensor(point[i])
-        else:
-            point = [point]
-            img = img.unsqueeze(0) if self.train else img
-
-        # random flipping
-        if random.random() > 0.5 and self.train and self.flip:
-            # random flip
-            img = torch.Tensor(img[:, :, :, ::-1].copy())
-            for i, _ in enumerate(point):
-                point[i][:, 0] = 128 - point[i][:, 0] if self.patch else img.shape[-1] - point[i][:, 0]
-
-        if not self.train:
-            # Ensure it is a list of arrays/tensors for consistency
-            if not isinstance(point, list):
-                point = [point]
-
-        # For train and patch=False, img has an extra dimension we don't want unless collate handles it.
-        # Wait, if patch=True, img has shape [num_patch, C, H, W]
-        # If patch=False, we must ensure the shape is correct.
-        # Actually in P2PNet, SHHA always uses patch=True for training, so let's stick to that.
-        if self.train and not self.patch:
-             img = img.squeeze(0)
-
-        img = torch.Tensor(img)
+        point = [point]
+        img = torch.as_tensor(img, dtype=torch.float32)
         # pack up related infos
         target = [{} for i in range(len(point))]
         for i, _ in enumerate(point):
@@ -97,6 +67,52 @@ class Steelbar(Dataset):
             target[i]['labels'] = torch.ones([point[i].shape[0]]).long()
 
         return img, target
+
+    def _augment(self, img, point):
+        width, height = img.size
+
+        # Random 90-degree rotations preserve geometry for point counting.
+        angle = random.choice([0, 90, 180, 270])
+        if angle:
+            img = TF.rotate(img, angle, expand=True)
+            point = self._rotate_points(point, width, height, angle)
+            width, height = img.size
+
+        if random.random() > 0.5:
+            img = TF.hflip(img)
+            if len(point) > 0:
+                point[:, 0] = width - point[:, 0]
+
+        if random.random() > 0.5:
+            img = TF.vflip(img)
+            if len(point) > 0:
+                point[:, 1] = height - point[:, 1]
+
+        if self.color_jitter is not None:
+            img = self.color_jitter(img)
+
+        return img, point
+
+    @staticmethod
+    def _rotate_points(point, width, height, angle):
+        if len(point) == 0:
+            return point
+
+        rotated = point.copy()
+        x = point[:, 0].copy()
+        y = point[:, 1].copy()
+
+        if angle == 90:
+            rotated[:, 0] = y
+            rotated[:, 1] = width - x
+        elif angle == 180:
+            rotated[:, 0] = width - x
+            rotated[:, 1] = height - y
+        elif angle == 270:
+            rotated[:, 0] = height - y
+            rotated[:, 1] = x
+
+        return rotated
 
 def load_data(img_gt_path, train):
     img_path, gt_path = img_gt_path

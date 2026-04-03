@@ -77,6 +77,9 @@ def get_args_parser():
 
 def main(args):
     os.environ["CUDA_VISIBLE_DEVICES"] = '{}'.format(args.gpu_id)
+    for path in [args.output_dir, args.checkpoints_dir, args.tensorboard_dir]:
+        if path:
+            os.makedirs(path, exist_ok=True)
     # create the logging file
     run_log_name = os.path.join(args.output_dir, 'run_log.txt')
     with open(run_log_name, "w") as log_file:

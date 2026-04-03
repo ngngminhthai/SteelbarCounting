@@ -4,6 +4,7 @@ Mostly copy-paste from torchvision references.
 """
 import torch
 import torch.nn as nn
+from torch.hub import load_state_dict_from_url
 
 
 __all__ = [
@@ -21,13 +22,6 @@ model_urls = {
     'vgg13_bn': 'https://download.pytorch.org/models/vgg13_bn-abd245e5.pth',
     'vgg16_bn': 'https://download.pytorch.org/models/vgg16_bn-6c64b313.pth',
     'vgg19_bn': 'https://download.pytorch.org/models/vgg19_bn-c79401a0.pth',
-}
-
-
-model_paths = {
-    'vgg16_bn': '/apdcephfs/private_changanwang/checkpoints/vgg16_bn-6c64b313.pth',
-    'vgg16': '/apdcephfs/private_changanwang/checkpoints/vgg16-397923af.pth',
-
 }
 
 
@@ -103,7 +97,7 @@ def _vgg(arch, cfg, batch_norm, pretrained, progress, sync=False, **kwargs):
         kwargs['init_weights'] = False
     model = VGG(make_layers(cfgs[cfg], batch_norm=batch_norm, sync=sync), **kwargs)
     if pretrained:
-        state_dict = torch.load(model_paths[arch])
+        state_dict = load_state_dict_from_url(model_urls[arch], progress=progress)
         model.load_state_dict(state_dict)
     return model
 

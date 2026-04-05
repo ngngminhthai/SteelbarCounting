@@ -13,18 +13,22 @@ from models import build_model
 
 # Hardcoded config
 CHECKPOINT_PATH = Path(r"C:\Users\User\Downloads\CrowdCounting-P2PNet\best_mae.pth")
-IMAGE_PATH = Path(r"C:\Users\User\Downloads\CrowdCounting-P2PNet\steelbar_dataset\images\00000815781100048206.Image.002623_p96.jpg")
+IMAGE_PATH = Path(r"C:\Users\User\Downloads\00000815429100048316.Image.235000-test.png")
 OUTPUT_IMAGE_PATH = Path(r"C:\Users\User\Downloads\CrowdCounting-P2PNet\inference_result.jpg")
 OUTPUT_JSON_PATH = Path(r"C:\Users\User\Downloads\CrowdCounting-P2PNet\inference_result.json")
 
 BACKBONE = "vgg16_bn"
 ROW = 2
 LINE = 2
-THRESHOLD = 0.5
+THRESHOLD = 0.3
 POINT_RADIUS = 4
 POINT_COLOR_BGR = (0, 0, 255)
 TEXT_COLOR_BGR = (255, 255, 255)
 TEXT_BG_COLOR_BGR = (0, 0, 0)
+
+SLICE_SIZE = 512
+SLICE_OVERLAP = 128  # overlap between slices to avoid missing detections at edges
+DEDUP_MIN_DIST = 20  # minimum pixel distance between two kept points; closer ones are merged
 
 
 def build_config():
@@ -48,18 +52,56 @@ def load_checkpoint(model, checkpoint_path, device):
     return checkpoint
 
 
-def preprocess_image(image_path):
-    image = Image.open(image_path).convert("RGB")
+def preprocess_pil(image: Image.Image):
     transform = T.Compose([
         T.ToTensor(),
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
-    tensor = transform(image).unsqueeze(0)
-    return image, tensor
+    return transform(image).unsqueeze(0)
+
+
+def generate_slices(image_w, image_h, slice_size, overlap):
+    """Yield (x0, y0, x1, y1) for each slice tile covering the full image."""
+    stride = slice_size - overlap
+    xs = list(range(0, image_w, stride))
+    ys = list(range(0, image_h, stride))
+    for y0 in ys:
+        for x0 in xs:
+            x1 = min(x0 + slice_size, image_w)
+            y1 = min(y0 + slice_size, image_h)
+            # Shift window left/up if it's smaller than slice_size (edge tiles)
+            x0 = max(0, x1 - slice_size)
+            y0 = max(0, y1 - slice_size)
+            yield x0, y0, x1, y1
+
+
+def deduplicate_points(points, scores, min_dist=DEDUP_MIN_DIST):
+    """Remove duplicate detections that are very close together (from overlapping slices)."""
+    if len(points) == 0:
+        return points, scores
+
+    keep = np.ones(len(points), dtype=bool)
+    # Sort by score descending so higher-confidence detections are kept
+    order = np.argsort(-scores)
+    points = points[order]
+    scores = scores[order]
+
+    for i in range(len(points)):
+        if not keep[i]:
+            continue
+        for j in range(i + 1, len(points)):
+            if not keep[j]:
+                continue
+            dx = points[i][0] - points[j][0]
+            dy = points[i][1] - points[j][1]
+            if dx * dx + dy * dy < min_dist * min_dist:
+                keep[j] = False
+
+    return points[keep], scores[keep]
 
 
 @torch.no_grad()
-def predict_points(model, image_tensor, device):
+def predict_points_on_tensor(model, image_tensor, device):
     image_tensor = image_tensor.to(device)
     outputs = model(image_tensor)
     scores = torch.softmax(outputs["pred_logits"], dim=-1)[0, :, 1]
@@ -70,6 +112,41 @@ def predict_points(model, image_tensor, device):
     kept_points = points[keep].detach().cpu().numpy()
 
     return kept_points, kept_scores
+
+
+def predict_points_sliding_window(model, image: Image.Image, device):
+    """Run inference on 512x512 slices and remap points to original image coordinates."""
+    image_w, image_h = image.size
+    all_points = []
+    all_scores = []
+
+    slices = list(generate_slices(image_w, image_h, SLICE_SIZE, SLICE_OVERLAP))
+    print(f"Image size: {image_w}x{image_h} — {len(slices)} slices ({SLICE_SIZE}x{SLICE_SIZE}, overlap={SLICE_OVERLAP})")
+
+    for idx, (x0, y0, x1, y1) in enumerate(slices):
+        slice_img = image.crop((x0, y0, x1, y1))
+        tensor = preprocess_pil(slice_img)
+
+        points, scores = predict_points_on_tensor(model, tensor, device)
+
+        # Remap local slice coordinates → original image coordinates
+        if len(points) > 0:
+            points[:, 0] += x0
+            points[:, 1] += y0
+            all_points.append(points)
+            all_scores.append(scores)
+
+        if (idx + 1) % 20 == 0 or (idx + 1) == len(slices):
+            print(f"  Processed {idx + 1}/{len(slices)} slices …")
+
+    if len(all_points) == 0:
+        return np.empty((0, 2), dtype=np.float32), np.empty((0,), dtype=np.float32)
+
+    all_points = np.concatenate(all_points, axis=0)
+    all_scores = np.concatenate(all_scores, axis=0)
+
+    all_points, all_scores = deduplicate_points(all_points, all_scores)
+    return all_points, all_scores
 
 
 def draw_points(image, points, scores):
@@ -110,6 +187,8 @@ def save_points(points, scores, output_json_path):
     payload = {
         "count": int(len(points)),
         "threshold": THRESHOLD,
+        "slice_size": SLICE_SIZE,
+        "slice_overlap": SLICE_OVERLAP,
         "points": [
             {"x": float(point[0]), "y": float(point[1]), "score": float(score)}
             for point, score in zip(points, scores)
@@ -129,14 +208,13 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # The first model build will auto-download VGG weights if they are not already cached.
     model = build_model(build_config(), training=False)
     model.to(device)
     load_checkpoint(model, CHECKPOINT_PATH, device)
     model.eval()
 
-    original_image, image_tensor = preprocess_image(IMAGE_PATH)
-    points, scores = predict_points(model, image_tensor, device)
+    original_image = Image.open(IMAGE_PATH).convert("RGB")
+    points, scores = predict_points_sliding_window(model, original_image, device)
 
     drawn = draw_points(original_image, points, scores)
     cv2.imwrite(str(OUTPUT_IMAGE_PATH), drawn)

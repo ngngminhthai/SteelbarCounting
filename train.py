@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from crowd_datasets import build_dataset
 from engine import *
 from models import build_model
+from models.backbone import get_supported_backbones
 import os
 from tensorboardX import SummaryWriter
 import warnings
@@ -31,7 +32,7 @@ def get_args_parser():
                         help="Path to the pretrained model. If set, only the mask head will be trained")
 
     # * Backbone
-    parser.add_argument('--backbone', default='vgg16_bn', type=str,
+    parser.add_argument('--backbone', default='resnet50', type=str, choices=get_supported_backbones(),
                         help="Name of the convolutional backbone to use")
 
     # * Matcher

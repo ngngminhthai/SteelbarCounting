@@ -205,8 +205,10 @@ class P2PNet(nn.Module):
                                             num_anchor_points=num_anchor_points)
 
         self.anchor_points = AnchorPoints(pyramid_levels=[3,], row=row, line=line)
-
-        self.fpn = Decoder(256, 512, 512)
+        if not hasattr(self.backbone, "pyramid_channels"):
+            raise ValueError("Backbone must define `pyramid_channels` for decoder construction.")
+        c3_size, c4_size, c5_size = self.backbone.pyramid_channels
+        self.fpn = Decoder(c3_size, c4_size, c5_size)
 
     def forward(self, samples: NestedTensor):
         # get the backbone features

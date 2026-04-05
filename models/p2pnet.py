@@ -275,7 +275,7 @@ class SetCriterion_Crowd(nn.Module):
         loss_bbox = F.mse_loss(src_points, target_points, reduction='none')
 
         losses = {}
-        losses['loss_point'] = loss_bbox.sum() / num_points
+        losses['loss_points'] = loss_bbox.sum() / num_points
 
         return losses
 

@@ -13,11 +13,11 @@ from models import build_model
 
 # Hardcoded config
 CHECKPOINT_PATH = Path(r"C:\Users\User\Downloads\CrowdCounting-P2PNet\best_mae.pth")
-IMAGE_PATH = Path(r"C:\Users\User\Downloads\00000815429100048316.Image.235000-test.png")
+IMAGE_PATH = Path(r"c:\Users\User\Downloads\Demosteel\DemoOpenCV\images\00000816088100048149.Image.235958.jpg")
 OUTPUT_IMAGE_PATH = Path(r"C:\Users\User\Downloads\CrowdCounting-P2PNet\inference_result.jpg")
 OUTPUT_JSON_PATH = Path(r"C:\Users\User\Downloads\CrowdCounting-P2PNet\inference_result.json")
 
-BACKBONE = "vgg16_bn"
+BACKBONE = "resnet50"
 ROW = 2
 LINE = 2
 THRESHOLD = 0.3
@@ -28,7 +28,7 @@ TEXT_BG_COLOR_BGR = (0, 0, 0)
 
 SLICE_SIZE = 512
 SLICE_OVERLAP = 128  # overlap between slices to avoid missing detections at edges
-DEDUP_MIN_DIST = 20  # minimum pixel distance between two kept points; closer ones are merged
+DEDUP_MIN_DIST = 20  # final cleanup for any remaining close detections
 
 
 def build_config():
@@ -61,27 +61,53 @@ def preprocess_pil(image: Image.Image):
 
 
 def generate_slices(image_w, image_h, slice_size, overlap):
-    """Yield (x0, y0, x1, y1) for each slice tile covering the full image."""
+    """Yield unique (x0, y0, x1, y1) tiles covering the full image."""
     stride = slice_size - overlap
     xs = list(range(0, image_w, stride))
     ys = list(range(0, image_h, stride))
+    seen = set()
+
     for y0 in ys:
         for x0 in xs:
-            x1 = min(x0 + slice_size, image_w)
-            y1 = min(y0 + slice_size, image_h)
-            # Shift window left/up if it's smaller than slice_size (edge tiles)
-            x0 = max(0, x1 - slice_size)
-            y0 = max(0, y1 - slice_size)
-            yield x0, y0, x1, y1
+            cur_x0 = x0
+            cur_y0 = y0
+            x1 = min(cur_x0 + slice_size, image_w)
+            y1 = min(cur_y0 + slice_size, image_h)
+
+            # Shift edge tiles back so every tile keeps the target size.
+            cur_x0 = max(0, x1 - slice_size)
+            cur_y0 = max(0, y1 - slice_size)
+            tile = (cur_x0, cur_y0, x1, y1)
+
+            if tile in seen:
+                continue
+            seen.add(tile)
+            yield tile
+
+
+def get_slice_keep_bounds(x0, y0, x1, y1, image_w, image_h, overlap):
+    """
+    Return the trusted region for a tile in original-image coordinates.
+
+    Each overlapping area is split in half so one tile owns the left/top half
+    and the neighboring tile owns the right/bottom half.
+    """
+    half_overlap = overlap / 2.0
+
+    keep_x0 = x0 if x0 == 0 else x0 + half_overlap
+    keep_y0 = y0 if y0 == 0 else y0 + half_overlap
+    keep_x1 = x1 if x1 == image_w else x1 - half_overlap
+    keep_y1 = y1 if y1 == image_h else y1 - half_overlap
+
+    return keep_x0, keep_y0, keep_x1, keep_y1
 
 
 def deduplicate_points(points, scores, min_dist=DEDUP_MIN_DIST):
-    """Remove duplicate detections that are very close together (from overlapping slices)."""
+    """Remove any remaining very-close detections after tile ownership filtering."""
     if len(points) == 0:
         return points, scores
 
     keep = np.ones(len(points), dtype=bool)
-    # Sort by score descending so higher-confidence detections are kept
     order = np.argsort(-scores)
     points = points[order]
     scores = scores[order]
@@ -115,13 +141,16 @@ def predict_points_on_tensor(model, image_tensor, device):
 
 
 def predict_points_sliding_window(model, image: Image.Image, device):
-    """Run inference on 512x512 slices and remap points to original image coordinates."""
+    """Run inference on slices and remap points to original image coordinates."""
     image_w, image_h = image.size
     all_points = []
     all_scores = []
 
     slices = list(generate_slices(image_w, image_h, SLICE_SIZE, SLICE_OVERLAP))
-    print(f"Image size: {image_w}x{image_h} — {len(slices)} slices ({SLICE_SIZE}x{SLICE_SIZE}, overlap={SLICE_OVERLAP})")
+    print(
+        f"Image size: {image_w}x{image_h} - {len(slices)} slices "
+        f"({SLICE_SIZE}x{SLICE_SIZE}, overlap={SLICE_OVERLAP})"
+    )
 
     for idx, (x0, y0, x1, y1) in enumerate(slices):
         slice_img = image.crop((x0, y0, x1, y1))
@@ -129,15 +158,31 @@ def predict_points_sliding_window(model, image: Image.Image, device):
 
         points, scores = predict_points_on_tensor(model, tensor, device)
 
-        # Remap local slice coordinates → original image coordinates
         if len(points) > 0:
+            # Remap local slice coordinates to original image coordinates.
             points[:, 0] += x0
             points[:, 1] += y0
+
+            # Keep only the tile-owned center region to avoid duplicates from
+            # neighboring overlapping tiles.
+            keep_x0, keep_y0, keep_x1, keep_y1 = get_slice_keep_bounds(
+                x0, y0, x1, y1, image_w, image_h, SLICE_OVERLAP
+            )
+            keep_mask = (
+                (points[:, 0] >= keep_x0)
+                & (points[:, 0] < keep_x1)
+                & (points[:, 1] >= keep_y0)
+                & (points[:, 1] < keep_y1)
+            )
+            points = points[keep_mask]
+            scores = scores[keep_mask]
+
+        if len(points) > 0:
             all_points.append(points)
             all_scores.append(scores)
 
         if (idx + 1) % 20 == 0 or (idx + 1) == len(slices):
-            print(f"  Processed {idx + 1}/{len(slices)} slices …")
+            print(f"  Processed {idx + 1}/{len(slices)} slices")
 
     if len(all_points) == 0:
         return np.empty((0, 2), dtype=np.float32), np.empty((0,), dtype=np.float32)
